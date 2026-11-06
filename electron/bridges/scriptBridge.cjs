@@ -47,6 +47,14 @@ const cancelledQueuedRunGenerations = new Map();
 const runAbortControls = new Map();
 /** @type {Map<string, { connected?: boolean, name?: string, hostname?: string, username?: string }>} */
 const rendererSessionMetaById = new Map();
+/**
+ * Tombstones for sessions whose output buffer was released. The terminal data
+ * taps stay registered for the runtime's lifetime; without this, a late data
+ * event after close would revive the per-session buffer (up to 1 MB) with no
+ * later close event to remove it again.
+ */
+const closedScriptSessions = new Set();
+const MAX_CLOSED_SCRIPT_SESSIONS = 4096;
 let scriptRuntimeGeneration = 0;
 let disposeTerminalDataTap = null;
 let disposeWorkerOutputTap = null;
@@ -63,8 +71,29 @@ function disposeSubscription(subscription) {
 function releaseSessionResources(sessionId) {
   if (!sessionId) return;
   removeSessionBuffer(sessionId);
+  closedScriptSessions.add(sessionId);
+  if (closedScriptSessions.size > MAX_CLOSED_SCRIPT_SESSIONS) {
+    closedScriptSessions.delete(closedScriptSessions.values().next().value);
+  }
   rendererSessionMetaById.delete(sessionId);
   recordings.delete(sessionId);
+}
+
+/**
+ * Feed a terminal data tap event into the per-session output buffer, unless
+ * the session was already released. A tombstoned id may still be reopened
+ * (a tab reconnects with the same session id); output for a live session
+ * clears the tombstone and buffers again.
+ */
+function bufferSessionOutput(sessionId, data) {
+  if (!closedScriptSessions.has(sessionId)) {
+    appendSessionOutput(sessionId, data);
+    return;
+  }
+  if (terminalWorkerManager?.hasOpenSession?.(sessionId)) {
+    closedScriptSessions.delete(sessionId);
+    appendSessionOutput(sessionId, data);
+  }
 }
 
 function enqueueSessionRun(sessionId, task) {
@@ -113,10 +142,10 @@ function init(deps) {
   getMainWindow = deps.getMainWindow;
 
   disposeTerminalDataTap = addTerminalDataTap((sessionId, data) => {
-    appendSessionOutput(sessionId, data);
+    bufferSessionOutput(sessionId, data);
   });
   disposeWorkerOutputTap = terminalWorkerManager?.addOutputTap?.((sessionId, data) => {
-    appendSessionOutput(sessionId, data);
+    bufferSessionOutput(sessionId, data);
   }) ?? null;
   disposeWorkerSessionClosed = terminalWorkerManager?.onSessionClosed?.(({ sessionId }) => {
     releaseSessionResources(sessionId);

@@ -642,6 +642,10 @@ function createWorkerAiJobPollHandler({ backgroundJobs = new Map() }) {
   return function handleWorkerAiJobPoll(_event, payload = {}) {
     const { jobId, offset = 0, chatSessionId } = payload || {};
     if (!jobId) return { ok: false, error: "jobId is required" };
+    // Polls are the only steady traffic once a job finishes; prune here so
+    // completed jobs (and their retained stdout windows) cannot accumulate
+    // in a session that stops starting new jobs.
+    pruneCompletedWorkerJobs(backgroundJobs);
     const job = getScopedWorkerJob(backgroundJobs, jobId, chatSessionId || null);
     if (!job) return { ok: false, error: "Background job not found" };
     return serializeWorkerJob(job, offset);
@@ -652,6 +656,7 @@ function createWorkerAiJobStopHandler({ backgroundJobs = new Map() }) {
   return function handleWorkerAiJobStop(_event, payload = {}) {
     const { jobId, chatSessionId } = payload || {};
     if (!jobId) return { ok: false, error: "jobId is required" };
+    pruneCompletedWorkerJobs(backgroundJobs);
     const job = getScopedWorkerJob(backgroundJobs, jobId, chatSessionId || null);
     if (!job) return { ok: false, error: "Background job not found" };
     if (job.status === "running") {

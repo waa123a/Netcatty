@@ -1811,6 +1811,8 @@ function createTerminalWorkerManager(options = {}) {
     closedSessionGenerations.clear();
     supersedingSessionGenerations.clear();
     attachHomeWebContentsIds.clear();
+    pendingSessionStartBootEpochs.clear();
+    sessionBootEpochs.clear();
     pruneClosedSessionTombstones();
     closeAllUrgentInputPorts();
     rejectAllPending(error);

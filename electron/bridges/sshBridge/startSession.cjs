@@ -745,43 +745,49 @@ function createStartSessionApi(ctx) {
           if (liveSession === session) {
             const contents = event.sender;
             const transportError = liveSession?._transportError;
-            if (liveSession?.closed) {
-              // Explicit close already notified every attached renderer.
-            } else if (transportError) {
-              safeSendSessionExit({ safeSend, electronModule, sessions }, contents, sessionId, {
-                sessionId,
-                exitCode: 1,
-                error: transportError,
-                reason: "error",
-                _terminalSessionGeneration: liveSession?._terminalSessionGeneration,
-              });
-            } else {
-              // TMOUT auto-logout is a clean exit (numeric code, no signal) and
-              // is reported as "timeout" via the shell banner (#1062 / #977).
-              // An exit-signal is a separate administrative kick ("signaled").
-              // A channel close with neither exit-status nor exit-signal stays
-              // "closed" and must not be reported as code 0 (#3591).
-              const idleTimedOut = streamExited && looksLikeIdleAutoLogout(liveSession?._promptTrackTail);
-              const exitPayload = buildRemoteShellExitPayload({
-                sessionId,
-                generation: liveSession?._terminalSessionGeneration,
-                exitCode: streamExitCode,
-                exitSignal: streamExitSignal,
-                shellExited: streamExited,
-                idleTimedOut,
-              });
-              safeSendSessionExit({ safeSend, electronModule, sessions }, contents, sessionId, exitPayload);
+            try {
+              if (liveSession?.closed) {
+                // Explicit close already notified every attached renderer.
+              } else if (transportError) {
+                safeSendSessionExit({ safeSend, electronModule, sessions }, contents, sessionId, {
+                  sessionId,
+                  exitCode: 1,
+                  error: transportError,
+                  reason: "error",
+                  _terminalSessionGeneration: liveSession?._terminalSessionGeneration,
+                });
+              } else {
+                // TMOUT auto-logout is a clean exit (numeric code, no signal) and
+                // is reported as "timeout" via the shell banner (#1062 / #977).
+                // An exit-signal is a separate administrative kick ("signaled").
+                // A channel close with neither exit-status nor exit-signal stays
+                // "closed" and must not be reported as code 0 (#3591).
+                const idleTimedOut = streamExited && looksLikeIdleAutoLogout(liveSession?._promptTrackTail);
+                const exitPayload = buildRemoteShellExitPayload({
+                  sessionId,
+                  generation: liveSession?._terminalSessionGeneration,
+                  exitCode: streamExitCode,
+                  exitSignal: streamExitSignal,
+                  shellExited: streamExited,
+                  idleTimedOut,
+                });
+                safeSendSessionExit({ safeSend, electronModule, sessions }, contents, sessionId, exitPayload);
+              }
+              liveSession?.zmodemSentry?.cancel();
+              // Release this channel's hold on the shared connection. The transport
+              // (and any jump-host chain) is only ended once the last channel is
+              // gone, so closing a reused tab — or the original tab while a copy is
+              // still open — leaves the siblings connected.
+              releaseConnectionRef(liveSession);
+              closeTerminalOutputSession?.(sessionId);
+            } finally {
+              // Always drop the session maps even if a notification or transport
+              // release above throws; otherwise the session object (channel
+              // stream, buffers, decoders) would leak here until process exit.
+              sessions.delete(sessionId);
+              sessionEncodings.delete(sessionId);
+              sessionDecoders.delete(sessionId);
             }
-            liveSession?.zmodemSentry?.cancel();
-            // Release this channel's hold on the shared connection. The transport
-            // (and any jump-host chain) is only ended once the last channel is
-            // gone, so closing a reused tab — or the original tab while a copy is
-            // still open — leaves the siblings connected.
-            releaseConnectionRef(liveSession);
-            closeTerminalOutputSession?.(sessionId);
-            sessions.delete(sessionId);
-            sessionEncodings.delete(sessionId);
-            sessionDecoders.delete(sessionId);
           }
         };
         flushBufferPaced(finalizeClose);

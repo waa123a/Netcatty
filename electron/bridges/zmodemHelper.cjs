@@ -1665,15 +1665,61 @@ async function handleDownload(zsession, opts) {
     const ws = fs.createWriteStream(finalPath);
     let received = 0;
     let writeAborted = false;
+    // Bounded write queue: a slow disk must not let the fs stream's internal
+    // buffer grow without bound when the SSH link delivers faster than the
+    // kernel can flush. Chunks are queued in order and pushed into the stream
+    // as fast as it drains.
+    const pendingWrites = [];
+    let pendingWriteHead = 0;
+    let pendingWriteBytes = 0;
+    let drainScheduled = false;
+    // Resolved once every received payload byte has been handed to the stream
+    // (not necessarily flushed to disk yet), or the stream is gone.
+    const queuedWaiters = [];
+    const MAX_PENDING_WRITE_BYTES = 32 * 1024 * 1024;
+
+    const flushWrites = () => {
+      while (!writeAborted && !drainScheduled && pendingWriteHead < pendingWrites.length) {
+        const next = pendingWrites[pendingWriteHead];
+        pendingWriteHead += 1;
+        pendingWriteBytes -= next.length;
+        if (!ws.write(next)) {
+          drainScheduled = true;
+          ws.once("drain", () => {
+            drainScheduled = false;
+            flushWrites();
+          });
+          return;
+        }
+      }
+      if (pendingWriteHead >= pendingWrites.length && !drainScheduled) {
+        pendingWrites.length = 0;
+        pendingWriteHead = 0;
+        for (const resolve of queuedWaiters.splice(0)) resolve();
+      }
+    };
 
     // Track pending write streams (and paths) for cleanup at session end
-    pendingStreams.push({ stream: ws, path: finalPath, completed: false });
+    pendingStreams.push({
+      stream: ws,
+      path: finalPath,
+      completed: false,
+      queued: new Promise((resolve) => {
+        queuedWaiters.push(resolve);
+      }),
+    });
 
     ws.on("error", (err) => {
       writeAborted = true;
       console.error(`[ZMODEM] Write stream error for ${name}:`, err.message);
       ws.destroy();
+      for (const resolve of queuedWaiters.splice(0)) resolve();
       reject(err);
+    });
+    // 'close' always fires (end, destroy, or error), so the queued promise
+    // can never hang session_end's cleanup.
+    ws.on("close", () => {
+      for (const resolve of queuedWaiters.splice(0)) resolve();
     });
 
     xfer.accept({
@@ -1685,8 +1731,24 @@ async function handleDownload(zsession, opts) {
         const chunk = Array.isArray(payload)
           ? Buffer.from(payload)
           : Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength);
-        ws.write(chunk);
         received += chunk.length;
+        pendingWrites.push(chunk);
+        pendingWriteBytes += chunk.length;
+        if (pendingWriteBytes > MAX_PENDING_WRITE_BYTES) {
+          // The disk cannot keep up with the link. Abort loudly instead of
+          // buffering without bound.
+          const stall = new Error(
+            `ZMODEM download stalled: ${Math.round(MAX_PENDING_WRITE_BYTES / 1024 / 1024)} MB write queue exceeded`,
+          );
+          if (!writeAborted) {
+            writeAborted = true;
+            ws.destroy();
+            for (const resolve of queuedWaiters.splice(0)) resolve();
+            reject(stall);
+          }
+          return;
+        }
+        flushWrites();
 
         // Throttle progress IPC to ~10 updates/sec to avoid
         // overwhelming the renderer on fast links.
@@ -1712,7 +1774,11 @@ async function handleDownload(zsession, opts) {
     xfer.on("complete", () => {
       const entry = pendingStreams.find((e) => e.stream === ws);
       if (entry) entry.completed = true;
-      ws.end();
+      // End only after every received payload byte is in the stream; end()
+      // is ordered after the queued writes so no bytes are truncated.
+      (entry ? entry.queued : Promise.resolve()).then(() => {
+        if (!writeAborted && !ws.destroyed && !ws.writableEnded) ws.end();
+      });
     });
   };
 
@@ -1732,8 +1798,13 @@ async function handleDownload(zsession, opts) {
     zsession.on("session_end", async () => {
       try {
         await Promise.all(
-          pendingStreams.map((entry) => {
+          pendingStreams.map(async (entry) => {
             const { stream: s, path: filePath, completed } = entry;
+            // Let payload still queued for this stream be handed over (and
+            // end() called for completed transfers) before deciding whether
+            // it needs destroying, so a slow disk cannot truncate a file
+            // whose bytes were all received.
+            if (entry.queued) await entry.queued;
             if (s.writableFinished) {
               // Delete partial files that never completed
               if (!completed) {

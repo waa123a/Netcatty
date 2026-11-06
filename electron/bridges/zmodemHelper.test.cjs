@@ -1982,3 +1982,155 @@ test("output that disproves a header fragment is emitted without delay", () => {
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// Download write backpressure (bounded queue + drain + stall abort)
+// ---------------------------------------------------------------------------
+
+class MockWriteStream {
+  constructor() {
+    this.chunks = [];
+    this.destroyed = false;
+    this.writableEnded = false;
+    this.writableFinished = false;
+    this._listeners = new Map();
+  }
+  on(ev, fn) { this._add(ev, fn, false); return this; }
+  once(ev, fn) { this._add(ev, fn, true); return this; }
+  _add(ev, fn, once) {
+    const list = this._listeners.get(ev) ?? [];
+    list.push({ fn, once });
+    this._listeners.set(ev, list);
+  }
+  _fire(ev, ...args) {
+    const list = this._listeners.get(ev) ?? [];
+    this._listeners.set(ev, list.filter((entry) => !entry.once));
+    for (const entry of [...list]) entry.fn(...args);
+  }
+  // Always report backpressure so the queue is exercised.
+  write(chunk) {
+    if (this.destroyed) return false;
+    this.chunks.push(Buffer.from(chunk));
+    return false;
+  }
+  end() {
+    if (this.destroyed || this.writableEnded) return;
+    this.writableEnded = true;
+    this.writableFinished = true;
+    this._fire("finish");
+    this._fire("close");
+  }
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this._fire("close");
+  }
+  drain() {
+    this._fire("drain");
+  }
+  get concatenated() {
+    return Buffer.concat(this.chunks);
+  }
+}
+
+test("handleDownload queues payload under write backpressure and ends only after drain", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-zmodem-drain-"));
+  const originalCreateWriteStream = fs.createWriteStream;
+  const stream = new MockWriteStream();
+  fs.createWriteStream = () => stream;
+  try {
+    const handlers = new Map();
+    const xferHandlers = new Map();
+    let acceptHandler = null;
+    const xfer = {
+      get_details: () => ({ name: "payload.bin", size: 30 }),
+      accept: async (opts) => { acceptHandler = opts.on_input; },
+      on: (ev, fn) => xferHandlers.set(ev, fn),
+    };
+    const zsession = {
+      on(event, handler) { handlers.set(event, handler); },
+      start() {},
+    };
+    const done = handleDownload(zsession, {
+      sessionId: "session-1",
+      getWebContents: () => ({ isDestroyed: () => false, send() {} }),
+      selectDownloadDirectory: async () => ({ canceled: false, filePaths: [tempDir] }),
+    });
+
+    // The offer arrives after the directory picker resolves.
+    await new Promise((resolve) => setImmediate(resolve));
+    handlers.get("offer")(xfer);
+
+    const part1 = Buffer.from("aaaa1111");
+    const part2 = Buffer.from("bbbb2222");
+    const part3 = Buffer.from("cccc3333");
+    acceptHandler(part1);
+    acceptHandler(part2);
+    acceptHandler(part3);
+
+    // Backpressured stream: only the first chunk made it in; the rest wait
+    // in the bounded queue instead of the fs stream's unbounded buffer.
+    assert.equal(stream.chunks.length, 1);
+
+    xferHandlers.get("complete")();
+    // end() must wait until every queued payload byte is in the stream.
+    assert.equal(stream.writableEnded, false);
+
+    // Each drain lets one queued chunk through; after the queue empties the
+    // final drain releases the queued promise and end() runs.
+    stream.drain();
+    await new Promise((resolve) => setImmediate(resolve));
+    stream.drain();
+    await new Promise((resolve) => setImmediate(resolve));
+    stream.drain();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(stream.writableEnded, true);
+    assert.deepEqual(stream.concatenated, Buffer.concat([part1, part2, part3]));
+
+    handlers.get("session_end")();
+    await done;
+  } finally {
+    fs.createWriteStream = originalCreateWriteStream;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("handleDownload aborts when the write queue exceeds its bound", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-zmodem-stall-"));
+  const originalCreateWriteStream = fs.createWriteStream;
+  const stream = new MockWriteStream();
+  fs.createWriteStream = () => stream;
+  try {
+    const handlers = new Map();
+    let acceptHandler = null;
+    const xfer = {
+      get_details: () => ({ name: "big.bin", size: 64 * 1024 * 1024 }),
+      accept: async (opts) => { acceptHandler = opts.on_input; },
+      on: () => {},
+    };
+    const zsession = {
+      on(event, handler) { handlers.set(event, handler); },
+      start() {},
+    };
+    const done = handleDownload(zsession, {
+      sessionId: "session-1",
+      getWebContents: () => ({ isDestroyed: () => false, send() {} }),
+      selectDownloadDirectory: async () => ({ canceled: false, filePaths: [tempDir] }),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    handlers.get("offer")(xfer);
+
+    // 1 chunk is written immediately; 33 more megabytes exceed the 32 MB
+    // queue bound and must abort instead of buffering without limit.
+    const chunk = Buffer.alloc(1024 * 1024);
+    for (let index = 0; index < 34 && !stream.destroyed; index += 1) {
+      acceptHandler(chunk);
+    }
+    assert.equal(stream.destroyed, true);
+    await assert.rejects(done, /write queue exceeded/);
+  } finally {
+    fs.createWriteStream = originalCreateWriteStream;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});

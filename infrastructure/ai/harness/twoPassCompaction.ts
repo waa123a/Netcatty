@@ -1,12 +1,22 @@
 import type { ModelMessage } from 'ai';
 import { findSafeCompactionSplitIndex } from '../contextCompaction';
 
+/**
+ * Notes are tiny relative to the message prefix they summarize, but only when
+ * the producer closure is released. `pending` holds the in-flight production
+ * promise (whose closure retains the full prefix) and is nulled as soon as it
+ * settles; `note` keeps the settled string for reuse. The cache is additionally
+ * bounded so a long-lived app cannot accumulate entries from many sessions.
+ */
 interface CacheEntry {
   modelId: string;
   prefixLength: number;
   fingerprint: string;
-  notePromise: Promise<string>;
+  note: string | null;
+  pending: Promise<string> | null;
 }
+
+const MAX_ENTRIES = 32;
 
 function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
@@ -59,12 +69,39 @@ export class TwoPassCompactionCache {
     ) {
       return false;
     }
-    this.entries.set(chatSessionId, {
+    const entry: CacheEntry = {
       modelId,
       prefixLength,
       fingerprint,
-      notePromise: producer(prefix).then(note => note.slice(0, 12_000)).catch(() => ''),
-    });
+      note: null,
+      pending: producer(prefix).then(note => note.slice(0, 12_000)),
+    };
+    entry.pending = entry.pending.then(
+      (note) => {
+        // Drop the producer closure (which retains the full prefix array) the
+        // moment the note settles; only the summarized string is kept.
+        if (this.entries.get(chatSessionId) === entry) {
+          entry.note = note;
+          entry.pending = null;
+        }
+        return note;
+      },
+      () => {
+        if (this.entries.get(chatSessionId) === entry) {
+          entry.note = '';
+          entry.pending = null;
+        }
+        return '';
+      },
+    );
+    this.entries.set(chatSessionId, entry);
+    // Bounded cache: evict the oldest insertion so failed/abandoned sessions
+    // cannot pin their prefixes here for the app's lifetime.
+    while (this.entries.size > MAX_ENTRIES) {
+      const oldestKey = this.entries.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.entries.delete(oldestKey);
+    }
     return true;
   }
 
@@ -83,7 +120,7 @@ export class TwoPassCompactionCache {
       this.entries.delete(chatSessionId);
       return undefined;
     }
-    const note = await entry.notePromise;
+    const note = entry.pending ? await entry.pending : entry.note;
     return note ? { note, prefixLength: entry.prefixLength } : undefined;
   }
 
